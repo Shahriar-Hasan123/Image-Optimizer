@@ -298,5 +298,3 @@ Returned in the API response under `method`.
 - [ ] Animated WebP upload → `method == "skipped"`, unchanged
 - [ ] SVG with fake `.svg` extension but non-SVG bytes → rejected at validation
 - [ ] Oversized dimensions for `thumbnail` → `dimension_capped: true`, resized proportionally
-- [ ] Undersized dimensions for any type → 400 validation error
-- [ ] High-entropy image with tiny target (`logo`, 100 KB) → still returns `<= 100 KB` via `forced_fit`
