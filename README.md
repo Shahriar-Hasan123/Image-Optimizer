@@ -72,7 +72,7 @@ optimized_size <= original_size
 
 ```bash
 # 1. Clone and create a virtual environment
-git clone <your-repo-url>
+git clone https://github.com/Shahriar-Hasan123/Image-Optimizer.git
 cd image_optimizer
 python3 -m venv venv
 source venv/bin/activate   # Windows: venv\Scripts\activate
