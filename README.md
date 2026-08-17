@@ -36,6 +36,8 @@ optimized_size <= original_size
 
 - **Hybrid compression** — lossless → near-lossless → tiered lossy
   (quality-first, then resize) → guaranteed forced-fit last resort
+- **Smart lossy fallback** — tries AVIF quality-only, then AVIF with progressive resizing,
+  then WebP quality-only, then WebP with progressive resizing, finally forced-fit
 - **Per-type targets** — thumbnail / logo / regular / hero each have their
   own target size and dimension constraints
 - **Format-aware** — JPEG, PNG, WebP, AVIF, GIF, SVG each get handling
@@ -190,16 +192,16 @@ Source already lossy (JPEG / AVIF)?
       └───────────────────────┤
                                ▼
                   STEP 2 — Lossy (tiered, quality before resize)
-                    Tier A: quality 75–95, scale 1.0 → 0.2
-                    Tier B: quality 40–74, scale 1.0 → 0.2
-                    Tier C: quality 10–39, scale 1.0 → 0.2
+                    2a. AVIF: quality-only at original dimensions
+                    2b. AVIF: progressive resize (0.9 → 0.1) + quality search
+                    2c. WebP: quality-only at original dimensions
+                    2d. WebP: progressive resize (0.9 → 0.1) + quality search
                                │
                   fits target? ──yes──► DONE
                                │ no
                                ▼
                   STEP 3 — Forced fit (guaranteed)
-                    scale to 10%, quality 10
-                    (quality 1 as absolute last resort)
+                    WebP at 0.1 scale, quality 1
                                │
                                ▼
                   Post-compression validation
@@ -223,9 +225,9 @@ Returned in the API response under `method`.
 | `skipped`        | GIF / SVG / animated image — untouched                           |
 | `lossless`       | Pixel-identical recompression (PNG optimize / verified quantize / WebP lossless) |
 | `near_lossless`  | WebP near-lossless smoothing — imperceptible quality cost        |
-| `lossy`          | Quality-reduced encode, original dimensions kept                 |
-| `lossy_resized`  | Quality-reduced encode with proportional downscaling              |
-| `forced_fit`     | Last-resort guarantee path — aggressive scale + quality floor    |
+| `lossy`          | Quality-only compression at original dimensions                 |
+| `lossy_resized`  | Quality + progressive resizing fallback (0.9 → 0.1 scale)       |
+| `lossy_forced_fit` | Last-resort: extreme downscaling (0.1 scale) + minimum quality  |
 
 ---
 

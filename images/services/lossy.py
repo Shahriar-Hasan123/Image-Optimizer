@@ -1,8 +1,7 @@
 import io
-import logging
 from PIL import Image
 
-logger = logging.getLogger(__name__)
+from ..constants import RESIZE_SCALE_STEPS, FORCED_FIT_SCALE
 
 AVIF_SEARCH_SPEED = 6
 AVIF_FINAL_SPEED = 0
@@ -25,7 +24,7 @@ def _encode_webp(img: Image.Image, quality: int, method: int = 6) -> bytes:
 def _binary_search_quality(
     img, target_bytes, encode_fn, q_min=QUALITY_MIN, q_max=QUALITY_MAX
 ):
-    """Highest quality whose encoded size <= target, at ORIGINAL dimensions only."""
+    """Highest quality whose encoded size <= target, at current dimensions."""
     low, high, best = q_min, q_max, None
     while low <= high:
         mid = (low + high) // 2
@@ -38,18 +37,29 @@ def _binary_search_quality(
     return best
 
 
-def compress_lossy(img: Image.Image, target_bytes: int, has_alpha: bool):
-    """
-    AVIF-primary, quality-only search — NO resizing anywhere in this
-    function, per explicit instructor requirement. Dimensions are never
-    altered; only quality is reduced, down to QUALITY_MIN=1 if necessary.
+def _try_resize_fallback(img: Image.Image, target_bytes: int, encode_fn):
+    """Try progressively smaller scales to fit target."""
+    
+    scales = list(RESIZE_SCALE_STEPS) + [FORCED_FIT_SCALE]
+    
+    for scale in scales:
+        w, h = img.size
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+        resized = img.resize((new_w, new_h), Image.LANCZOS)
+        
+        result = _binary_search_quality(resized, target_bytes, encode_fn)
+        if result:
+            quality, data = result
+            return data, quality, scale
+    
+    return None
 
-    Trade-off this creates: if even quality=1 at original resolution still
-    exceeds target_bytes, the target CANNOT be met without resizing — that
-    case is logged clearly and the smallest achievable result is returned
-    rather than silently claiming success.
-    """
+
+def compress_lossy(img: Image.Image, target_bytes: int, has_alpha: bool):
+    """AVIF-primary with resize fallback when quality-only fails."""
     try:
+        # Step 1: Quality-only at original dimensions
         result = _binary_search_quality(
             img, target_bytes, lambda im, q: _encode_avif(im, q, AVIF_SEARCH_SPEED)
         )
@@ -57,37 +67,47 @@ def compress_lossy(img: Image.Image, target_bytes: int, has_alpha: bool):
             quality, search_data = result
             data = _encode_avif(img, quality, AVIF_FINAL_SPEED)
             if len(data) > target_bytes:
-                data = search_data  # high-effort re-encode grew — use the verified search bytes
-            logger.info(
-                "AVIF quality-only fit: quality=%s size=%sB target=%sB",
-                quality,
-                len(data),
-                target_bytes,
-            )
-            return data, "AVIF", "lossy", {"quality": quality}
+                data = search_data
+            if len(data) <= target_bytes:
+                return data, "AVIF", "lossy", {"quality": quality}
 
-        # quality=1 still doesn't fit — target cannot be met without resizing
-        data = _encode_avif(img, QUALITY_MIN, AVIF_FINAL_SPEED)
-        logger.warning(
-            "Target NOT met without resizing: quality=1 size=%sB still exceeds target=%sB",
-            len(data),
-            target_bytes,
+        # Step 2: Resize fallback for AVIF
+        result = _try_resize_fallback(
+            img, target_bytes, lambda im, q: _encode_avif(im, q, AVIF_FINAL_SPEED)
         )
-        return data, "AVIF", "quality_floor_exceeded", {"quality": QUALITY_MIN}
+        if result:
+            data, quality, scale = result
+            if len(data) <= target_bytes:
+                return data, "AVIF", "lossy_resized", {"quality": quality, "scale": scale}
 
-    except Exception:
-        logger.exception("AVIF failed — falling back to WEBP, quality-only, no resize")
+        # Step 3: Quality-only WebP
         result = _binary_search_quality(
             img, target_bytes, lambda im, q: _encode_webp(im, q, method=4)
         )
         if result:
-            quality, _ = result
+            quality, search_data = result
             data = _encode_webp(img, quality, method=6)
-            return data, "WEBP", "lossy", {"quality": quality}
-        data = _encode_webp(img, QUALITY_MIN, method=6)
-        logger.warning(
-            "WEBP fallback also exceeded target at quality=1: size=%sB target=%sB",
-            len(data),
-            target_bytes,
+            if len(data) > target_bytes:
+                data = search_data
+            if len(data) <= target_bytes:
+                return data, "WEBP", "lossy", {"quality": quality}
+
+        # Step 4: Resize fallback for WebP
+        result = _try_resize_fallback(
+            img, target_bytes, lambda im, q: _encode_webp(im, q, method=6)
         )
-        return data, "WEBP", "quality_floor_exceeded", {"quality": QUALITY_MIN}
+        if result:
+            data, quality, scale = result
+            if len(data) <= target_bytes:
+                return data, "WEBP", "lossy_resized", {"quality": quality, "scale": scale}
+
+        # Fallback: return smallest WEBP at minimum scale
+        w, h = img.size
+        new_w = max(1, int(w * FORCED_FIT_SCALE))
+        new_h = max(1, int(h * FORCED_FIT_SCALE))
+        resized = img.resize((new_w, new_h), Image.LANCZOS)
+        data = _encode_webp(resized, QUALITY_MIN, method=6)
+        return data, "WEBP", "lossy_forced_fit", {"quality": QUALITY_MIN, "scale": FORCED_FIT_SCALE}
+
+    except Exception as e:
+        raise RuntimeError(f"Lossy compression failed: {e}")
