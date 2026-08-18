@@ -3,28 +3,29 @@ from PIL import Image
 
 from ..constants import RESIZE_SCALE_STEPS, FORCED_FIT_SCALE
 
+# Speed 6 is fast for searching; Speed 2 is highly efficient for production saves without CPU locks
 AVIF_SEARCH_SPEED = 6
-AVIF_FINAL_SPEED = 0
+AVIF_FINAL_SPEED = 2
+
+# Enforce strict quality bounds to protect zoom fidelity
 QUALITY_MIN = 1
 QUALITY_MAX = 95
 
+# Search order: 4:4:4 preserves sharp text/edges, 4:2:2 balances detail, 4:2:0 maximizes compression
+SUBSAMPLING_CANDIDATES = ("4:4:4", "4:2:2", "4:2:0")
 
-def _encode_avif(img: Image.Image, quality: int, speed: int) -> bytes:
+
+def _encode_avif(img: Image.Image, quality: int, speed: int, subsampling: str) -> bytes:
     buf = io.BytesIO()
-    img.save(buf, format="AVIF", quality=quality, speed=speed)
-    return buf.getvalue()
-
-
-def _encode_webp(img: Image.Image, quality: int, method: int = 6) -> bytes:
-    buf = io.BytesIO()
-    img.save(buf, format="WEBP", quality=quality, method=method)
+    img.save(buf, format="AVIF", quality=quality, speed=speed, subsampling=subsampling)
     return buf.getvalue()
 
 
 def _binary_search_quality(
-    img, target_bytes, encode_fn, q_min=QUALITY_MIN, q_max=QUALITY_MAX
+    img: Image.Image, target_bytes: int, encode_fn, q_min=QUALITY_MIN, q_max=QUALITY_MAX
 ):
-    """Highest quality whose encoded size <= target, at current dimensions."""
+    """Finds highest quality (>= QUALITY_MIN) whose encoded size <= target_bytes."""
+
     low, high, best = q_min, q_max, None
     while low <= high:
         mid = (low + high) // 2
@@ -37,77 +38,92 @@ def _binary_search_quality(
     return best
 
 
-def _try_resize_fallback(img: Image.Image, target_bytes: int, encode_fn):
-    """Try progressively smaller scales to fit target."""
-    
-    scales = list(RESIZE_SCALE_STEPS) + [FORCED_FIT_SCALE]
-    
-    for scale in scales:
-        w, h = img.size
-        new_w = max(1, int(w * scale))
-        new_h = max(1, int(h * scale))
-        resized = img.resize((new_w, new_h), Image.LANCZOS)
-        
-        result = _binary_search_quality(resized, target_bytes, encode_fn)
+def _search_at_dimensions(img: Image.Image, target_bytes: int):
+    """Try each subsampling candidate at current dimensions, prioritizing 4:4:4."""
+
+    for subsampling in SUBSAMPLING_CANDIDATES:
+        result = _binary_search_quality(
+            img,
+            target_bytes,
+            lambda im, q, ss=subsampling: _encode_avif(im, q, AVIF_SEARCH_SPEED, ss),
+        )
         if result:
-            quality, data = result
-            return data, quality, scale
-    
+            quality, search_data = result
+            data = _encode_avif(img, quality, AVIF_FINAL_SPEED, subsampling)
+
+            # Guard against edge-case encoder size shifts at lower speed
+            if len(data) > target_bytes:
+                data = search_data
+
+            if len(data) <= target_bytes:
+                return data, quality, subsampling
+
     return None
 
 
-def compress_lossy(img: Image.Image, target_bytes: int, has_alpha: bool):
-    """AVIF-primary with resize fallback when quality-only fails."""
-    try:
-        # Step 1: Quality-only at original dimensions
-        result = _binary_search_quality(
-            img, target_bytes, lambda im, q: _encode_avif(im, q, AVIF_SEARCH_SPEED)
-        )
-        if result:
-            quality, search_data = result
-            data = _encode_avif(img, quality, AVIF_FINAL_SPEED)
-            if len(data) > target_bytes:
-                data = search_data
-            if len(data) <= target_bytes:
-                return data, "AVIF", "lossy", {"quality": quality}
+def _try_resize_fallback(img: Image.Image, target_bytes: int):
+    """Progressively smaller scales using 4:2:0 subsampling."""
 
-        # Step 2: Resize fallback for AVIF
-        result = _try_resize_fallback(
-            img, target_bytes, lambda im, q: _encode_avif(im, q, AVIF_FINAL_SPEED)
-        )
-        if result:
-            data, quality, scale = result
-            if len(data) <= target_bytes:
-                return data, "AVIF", "lossy_resized", {"quality": quality, "scale": scale}
-
-        # Step 3: Quality-only WebP
-        result = _binary_search_quality(
-            img, target_bytes, lambda im, q: _encode_webp(im, q, method=4)
-        )
-        if result:
-            quality, search_data = result
-            data = _encode_webp(img, quality, method=6)
-            if len(data) > target_bytes:
-                data = search_data
-            if len(data) <= target_bytes:
-                return data, "WEBP", "lossy", {"quality": quality}
-
-        # Step 4: Resize fallback for WebP
-        result = _try_resize_fallback(
-            img, target_bytes, lambda im, q: _encode_webp(im, q, method=6)
-        )
-        if result:
-            data, quality, scale = result
-            if len(data) <= target_bytes:
-                return data, "WEBP", "lossy_resized", {"quality": quality, "scale": scale}
-
-        # Fallback: return smallest WEBP at minimum scale
+    for scale in RESIZE_SCALE_STEPS:
         w, h = img.size
-        new_w = max(1, int(w * FORCED_FIT_SCALE))
-        new_h = max(1, int(h * FORCED_FIT_SCALE))
-        resized = img.resize((new_w, new_h), Image.LANCZOS)
-        data = _encode_webp(resized, QUALITY_MIN, method=6)
-        return data, "WEBP", "lossy_forced_fit", {"quality": QUALITY_MIN, "scale": FORCED_FIT_SCALE}
+        new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
+
+        # Resample once using Lanczos to preserve edge sharpness
+        resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+        # Early check: If min acceptable quality (70) at this scale is still too big, skip to smaller scale
+        min_quality_data = _encode_avif(
+            resized, QUALITY_MIN, AVIF_SEARCH_SPEED, "4:2:0"
+        )
+        if len(min_quality_data) > target_bytes:
+            continue
+
+        result = _binary_search_quality(
+            resized,
+            target_bytes,
+            lambda im, q: _encode_avif(im, q, AVIF_SEARCH_SPEED, "4:2:0"),
+        )
+        if result:
+            quality, search_data = result
+            data = _encode_avif(resized, quality, AVIF_FINAL_SPEED, "4:2:0")
+            if len(data) > target_bytes:
+                data = search_data
+            return data, quality, scale
+
+    return None
+
+
+def compress_lossy(img: Image.Image, target_bytes: int):
+    """AVIF compression prioritized for zoom preservation and byte budget targeting."""
+
+    try:
+        # 1. High-fidelity pass (Original dimensions + 4:4:4 / 4:2:2 / 4:2:0 search)
+        result = _search_at_dimensions(img, target_bytes)
+        if result:
+            data, quality, subsampling = result
+            return (
+                data,
+                "AVIF",
+                "lossy",
+                {"quality": quality, "subsampling": subsampling},
+            )
+
+        # 2. Resampling fallback
+        result = _try_resize_fallback(img, target_bytes)
+        if result:
+            data, quality, scale = result
+            return (
+                data,
+                "AVIF",
+                "lossy_resized",
+                {"quality": quality, "subsampling": "4:2:0", "scale": scale},
+            )
+            
+        # 3. Exceeded target_bytes — target is unreachable for this image.
+        raise RuntimeError(
+            f"Could not reach target size ({target_bytes} bytes) even at "
+            f"minimum quality and smallest scale ({RESIZE_SCALE_STEPS[-1]})."
+        )
 
     except Exception as e:
-        raise RuntimeError(f"Lossy compression failed: {e}")
+        raise RuntimeError(f"Lossy compression failed: {e}") from e

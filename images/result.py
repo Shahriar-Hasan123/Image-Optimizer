@@ -12,6 +12,7 @@ class CompressionResult:
     optimized_size: int
     target_size: Optional[int] = None
     quality: Optional[int] = None
+    subsampling: Optional[str] = None
     near_lossless_level: Optional[int] = None
     scale: Optional[float] = None
     original_width: Optional[int] = None

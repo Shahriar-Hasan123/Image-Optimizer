@@ -2,7 +2,7 @@ from django.core.files.base import ContentFile
 from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
 
-from .models import ImageUpload
+from .models import ImageUpload, ImageVariant
 from .validators import (
     validate_upload_size,
     detect_format,
@@ -11,6 +11,7 @@ from .validators import (
     validate_min_dimensions,
 )
 from .services.optimizer import compress_image
+from .services.variations import generate_variants
 
 
 def human_readable_size(num_bytes: int) -> str:
@@ -19,6 +20,24 @@ def human_readable_size(num_bytes: int) -> str:
     if num_bytes >= 1024 * 1024:
         return f"{num_bytes / (1024 * 1024):.2f} MB"
     return f"{num_bytes / 1024:.2f} KB"
+
+class ImageVariantSerializer(serializers.ModelSerializer):
+    file_size_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ImageVariant
+        fields = [
+            "variant_type",
+            "image",
+            "width",
+            "height",
+            "format",
+            "file_size",
+            "file_size_display",
+        ]
+
+    def get_file_size_display(self, obj):
+        return human_readable_size(obj.file_size)
 
 
 class ImageUploadSerializer(serializers.ModelSerializer):
@@ -34,6 +53,7 @@ class ImageUploadSerializer(serializers.ModelSerializer):
     target_size_display = serializers.SerializerMethodField()
 
     compression_ratio = serializers.FloatField(read_only=True)
+    variants = ImageVariantSerializer(many=True, read_only=True)
 
     class Meta:
         model = ImageUpload
@@ -60,6 +80,7 @@ class ImageUploadSerializer(serializers.ModelSerializer):
             "near_lossless_level",
             "scale",
             "compression_ratio",
+            "variants",
             "created_at",
         ]
         read_only_fields = [f for f in fields if f not in ("image_file", "image_type")]
@@ -116,6 +137,27 @@ class ImageUploadSerializer(serializers.ModelSerializer):
             near_lossless_level=result.near_lossless_level,
             scale=result.scale,
         )
-        instance.image.save(result.filename, ContentFile(result.data), save=False)
+        
+        # Save instance FIRST to assign DB ID
         instance.save()
+          
+        instance.image.save(result.filename, ContentFile(result.data), save=False)
+        
+        # Save variants using parent ID
+        variant_objs = []
+        for v in generate_variants(result, image_type):
+            variant = ImageVariant(
+                image_upload=instance,
+                variant_type=v["variant_type"],
+                width=v["width"],
+                height=v["height"],
+                format=v["format"],
+                file_size=v["file_size"],
+            )
+            variant.image.save(v["filename"], ContentFile(v["data"]), save=False)
+            variant_objs.append(variant)
+
+        if variant_objs:
+            ImageVariant.objects.bulk_create(variant_objs)
+
         return instance

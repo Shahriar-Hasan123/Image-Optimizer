@@ -5,6 +5,14 @@ TARGET_SIZES = {
     'logo': 100 * 1024,
 }
 
+
+RESPONSIVE_VARIANT_WIDTHS = {
+    'thumbnail': {'mobile': 150,  'laptop': 300,  'desktop': 400},
+    'logo':      {'mobile': 120,  'laptop': 200,  'desktop': 300},
+    'regular':   {'mobile': 480,  'laptop': 1366, 'desktop': 1920},
+    'hero':      {'mobile': 480,  'laptop': 1600, 'desktop': 1920},
+}
+
 DIMENSION_CONSTRAINTS = {
     'thumbnail': {'min_w': 50,   'min_h': 50,   'max_w': 800,   'max_h': 800},
     'logo':      {'min_w': 50,   'min_h': 50,   'max_w': 1000,  'max_h': 1000},
@@ -23,5 +31,5 @@ QUALITY_HIGH_FLOOR = 75
 QUALITY_FLOOR_SOFT = 40    # preferred floor — quality below this only used as last resort
 QUALITY_FLOOR_HARD = 10    # absolute floor for the forced-fit guarantee step
 NEAR_LOSSLESS_LEVELS = (95, 90, 85, 80, 75)
-RESIZE_SCALE_STEPS = (0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2)
+RESIZE_SCALE_STEPS = (0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1)
 FORCED_FIT_SCALE = 0.1     # only reached if every prior rung fails

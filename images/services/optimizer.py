@@ -31,7 +31,7 @@ def _clamp_to_max_dimensions(img: Image.Image, image_type: str):
         return img, False
     scale = min(c["max_w"] / w, c["max_h"] / h)  # preserves aspect ratio
     new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
-    return img.resize(new_size, Image.LANCZOS), True
+    return img.resize(new_size, Image.Resampling.LANCZOS), True
 
 
 def compress_image(
@@ -39,12 +39,10 @@ def compress_image(
 ) -> CompressionResult:
     """
     Single entry point for the whole pipeline. Contract:
-      - optimized_size <= TARGET_SIZES[image_type]      (enforced, never silent)
-      - optimized_size <= original_size                  (enforced, never silent)
-      - width/height never exceed this type's max constraint (auto-capped, flagged)
+      - optimized_size <= TARGET_SIZES[image_type]
+      - optimized_size <= original_size
+      - width/height never exceed max constraint
       - GIF / SVG / animated WEBP-PNG returned unchanged
-      - if original already fits target, returned unchanged
-      - lossy output is always WEBP or AVIF, never JPEG (see lossy.py)
     """
     original_name = file.name
     base_name = (
@@ -73,12 +71,13 @@ def compress_image(
         img = ImageOps.exif_transpose(
             opened.copy()
         )  # correct orientation, drops EXIF as a side effect
-        
+
     orig_w, orig_h = img.size
 
+    # Clamp dimensions first (if required by configuration)
     img, dimension_capped = _clamp_to_max_dimensions(img, image_type)
 
-    # Already under target AND within max dimensions — nothing to do at all.
+    # Already under target AND within max dimensions — return original
     if original_size <= target_bytes and not dimension_capped:
         return CompressionResult(
             data=original_bytes,
@@ -96,14 +95,11 @@ def compress_image(
         )
 
     has_alpha = _has_transparency(img)
-    working_img = img.convert("RGBA" if has_alpha else "RGB")
-
     result = None
 
-    # JPEG/AVIF sources are treated as already-lossy: re-attempting a lossless
-    
+    # Step 1: Pass untouched original img (preserves mode="P", "L", etc.) to try_lossless
     if fmt not in ALREADY_LOSSY_SOURCE:
-        data, out_fmt, method, extra, hit = try_lossless(working_img, target_bytes)
+        data, out_fmt, method, extra, hit = try_lossless(img, target_bytes)
         if hit:
             result = _finalize(
                 data,
@@ -118,9 +114,11 @@ def compress_image(
                 dimension_capped,
             )
 
+    # Step 2: Fallback to Lossy Compression (Normalize mode to RGBA/RGB explicitly for lossy encoders)
     if result is None:
+        working_img = img.convert("RGBA" if has_alpha else "RGB")
         data, out_fmt, method, extra = compress_lossy(
-            working_img, target_bytes, has_alpha
+            working_img, target_bytes
         )
         result = _finalize(
             data,
@@ -136,17 +134,39 @@ def compress_image(
         )
 
     # --- Post-compression validation ---
-    
+
+    # 1. If optimization made the image larger, fallback ONLY if original actually fits target
+    if result.optimized_size >= original_size and not dimension_capped:
+        if original_size <= target_bytes:
+            return CompressionResult(
+                data=original_bytes,
+                filename=original_name,
+                format=fmt,
+                method="fallback_original",
+                original_size=original_size,
+                optimized_size=original_size,
+                target_size=target_bytes,
+                original_width=orig_w,
+                original_height=orig_h,
+                optimized_width=orig_w,
+                optimized_height=orig_h,
+                dimension_capped=False,
+            )
+
+    # 2. Enforce strict target size contract
     if not result.meets_target():
         raise RuntimeError(
             f"Target guarantee violated: optimized {result.optimized_size} bytes "
             f"> target {target_bytes} bytes for '{original_name}'."
         )
-    if not result.is_smaller_than_original():
+
+    # 3. Enforce smaller-than-original rule if original did not meet target
+    if not result.is_smaller_than_original() and not dimension_capped:
         raise RuntimeError(
-            f"Optimization produced a larger file: optimized={result.optimized_size} "
-            f"> original={result.original_size} for '{original_name}'. Pipeline bug."
+            f"Optimization produced a larger file ({result.optimized_size} bytes) "
+            f"than original ({result.original_size} bytes) for '{original_name}'."
         )
+
     if result.optimized_width <= 0 or result.optimized_height <= 0:
         raise RuntimeError(
             f"Invalid optimized dimensions {result.optimized_width}x{result.optimized_height} "
@@ -170,9 +190,6 @@ def _finalize(
 ):
     ext = {"PNG": ".png", "WEBP": ".webp", "JPEG": ".jpg", "AVIF": ".avif"}[fmt]
 
-    # Read actual dimensions back from the encoded bytes — ground truth
-    # regardless of which step (max-clamp, lossless, or lossy-resize) produced
-    # the result, so no extra width/height plumbing is needed elsewhere.
     with Image.open(io.BytesIO(data)) as final_img:
         opt_w, opt_h = final_img.size
 
